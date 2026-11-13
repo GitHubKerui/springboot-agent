@@ -43,9 +43,12 @@ public class ChatService {
 
     private final ChatMemory chatMemory;
 
+    /** 注入检索查询的历史问题最大长度，避免把整段模板文本带进检索 */
+    private static final int MAX_CONTEXT_QUESTION_LENGTH = 200;
+
     public String ask(String question, String conversationId) {
-        // 0. 从对话记忆中获取历史上下文，用于指代消解
-        String enrichedQuestion = enrichWithContext(question, conversationId);
+        // 0. 从对话记忆中获取历史上下文，用于指代消解（取最近一条用户消息）
+        String enrichedQuestion = enrichWithContextV2(question, conversationId);
         log.info("[RAG] 原始问题: '{}', 增强后: '{}'", question, enrichedQuestion);
         // 1. query
         Query query = Query.builder()
@@ -217,7 +220,14 @@ public class ChatService {
 
     /**
      * 将对话历史注入当前问题，解决指代消解问题（如“它”“这个”）
+     *
+     * @deprecated 实现有问题，保留仅作对照，请使用 {@link #enrichWithContextV2(String, String)}：
+     *             1. ChatMemory 按旧 → 新顺序返回，findFirst() 取到的是“最早一条”用户消息，
+     *                不是“上一轮”，多轮对话会指代到第一轮的实体；
+     *             2. 拼接的上下文没有长度限制，容易把整段模板文本带进检索。
      */
+    @Deprecated
+    @SuppressWarnings("unused")
     private String enrichWithContext(String question, String conversationId) {
         try {
             List<Message> history = chatMemory.get(conversationId);
@@ -242,9 +252,76 @@ public class ChatService {
     }
 
     /**
+     * 正确版本：取“最近一条”用户消息做指代消解。
+     *
+     * ChatMemory（MessageWindowChatMemory）按写入顺序返回，即旧 → 新，
+     * 所以从列表尾部往前找第一条 USER 消息；原方法的 findFirst() 拿到的是最早一条。
+     */
+    private String enrichWithContextV2(String question, String conversationId) {
+        try {
+            List<Message> history = chatMemory.get(conversationId);
+            if (history == null || history.isEmpty()) {
+                return question;
+            }
+
+            // 这个效率高，第一个匹配就跳出了。
+            String rawMessage = null;
+            for (int i = history.size() - 1; i >= 0; i--) {
+                Message message = history.get(i);
+                if (message.getMessageType() == MessageType.USER) {
+                    rawMessage = message.getText();
+                    break;
+                }
+            }
+
+            // 这个效率低 会遍历全部list
+            // String rawMessage = history.reversed().stream()
+            //     .filter(m -> m.getMessageType() == MessageType.USER)
+            //     .map(m -> m.getText())
+            //     .filter(Objects::nonNull)
+            //     .findFirst()
+            //     .orElse("");
+
+            if (rawMessage == null || rawMessage.isBlank()) {
+                return question;
+            }
+
+            // 提取原始prompt问题
+            String previousQuestion = extractOriginalQuestion(rawMessage);
+            if (previousQuestion.isBlank()) {
+                return question;
+            }
+            // 控制注入长度，避免把整段模板文本带进检索
+            if (previousQuestion.length() > MAX_CONTEXT_QUESTION_LENGTH) {
+                previousQuestion = previousQuestion.substring(0, MAX_CONTEXT_QUESTION_LENGTH) + "…";
+            }
+            return String.format("上一轮用户问的是关于“%s”的问题。当前问题：%s", previousQuestion, question);
+        } catch (Exception e) {
+            log.warn("[RAG] 获取对话历史失败，使用原始问题: {}", e.getMessage());
+            return question;
+        }
+    }
+
+    /**
      * 从存储的 prompt 中提取原始用户问题
      * MessageChatMemoryAdvisor 存储的是完整的 prompt（含 RAG 上下文），
      * 原始问题位于 【问题】 和 【语义信息（Vector Knowledge）】 之间
+     * 你是化学品安全专家（EHS / SDS 领域）。
+
+        【问题】
+        {question}
+
+        【语义信息（Vector Knowledge）】
+        {semantic}
+
+        【知识图谱路径（Graph Knowledge）】
+        {graph}
+
+        -----------------------------
+        请输出：
+        1. 风险说明
+        2. 处理步骤
+        3. 法规依据
      */
     private String extractOriginalQuestion(String rawMessage) {
         if (rawMessage == null || rawMessage.isBlank()) {

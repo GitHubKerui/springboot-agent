@@ -50,11 +50,16 @@ public class GraphRagService {
         return result;
     }
 
+    /* 这是图检索结果与 Spring AI RAG 生态对接的关键适配层。
+    Spring AI 的向量检索返回的是 List<Document>，这个方法一次只处理一条。
+    为了让图谱检索的结果能和向量检索结果"同台竞技"（比如做 RRF 融合、重排），这里把每一行图结果也包装成 Document。 */
     private Document toDocument(Map<String, Object> row) {
 
         // ✔ 图谱权重（关系强度 / 命中次数 / 可扩展算法）
         double graphScore = computeGraphScore(row);
-
+        /*
+            从cyppher返回的字段里提取并填入 %占位符
+         */
         String text = String.format(
                 "source=%s, relation=%s, target=%s",
                 row.get("source"),
@@ -76,6 +81,9 @@ public class GraphRagService {
                 .build();
     }
 
+    /*
+    computeGraphScore 等于是做了个频率的对数计算当做权重 靠。 
+     */
     private double computeGraphScore(Map<String, Object> row) {
 
         // ✔ 基础版本（后续可以升级 PageRank / NodeRank）
@@ -84,7 +92,12 @@ public class GraphRagService {
         double weight = weightObj == null ? 1.0 :
                 Double.parseDouble(weightObj.toString());
 
-        // ✔ 可以加规则增强
+        // 这里算对数的原因：
+        /* 
+        为什么用 log？ 因为 count(*) 可能长尾分布很严重（某条关系出现 100 次，另一条只出现 1 次）。
+        直接线性使用会让高频关系完全压制低频关系。log(1+w) 做对数压缩，让权重增长变缓，避免少数高频路径"霸榜"。
+        +1 是为了处理 weight=0 的边界（虽然 count(*) 至少为 1，但防御性写法 
+        */
         return Math.log(1 + weight);
     }
 }
